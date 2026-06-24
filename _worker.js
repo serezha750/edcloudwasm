@@ -859,57 +859,45 @@ const manualPipe = async (readable, writable, close) => {
     } catch {close?.(), isClose = true} finally {isReading = false, flushBuffer()}
 };
 const createBufferedTcpWriter = (tcpWriter, close) => {
-    let writeQueue = [], drainQueue = [], bundleBuffer = null, busy = false, isClosed = false;
+    let queue = [], bundleBuffer = null, timerId = null, isClosed = false;
     const closeWriter = () => {
         if (isClosed) return;
-        isClosed = true, writeQueue.length = 0, drainQueue.length = 0, close?.();
+        isClosed = true;
+        timerId && (clearTimeout(timerId), timerId = null);
+        queue.length = 0, close?.();
     };
-    const drain = async () => {
-        if (busy || isClosed) return;
-        busy = true;
-        try {
-            while (writeQueue.length && !isClosed) {
-                const tasks = writeQueue;
-                writeQueue = drainQueue;
-                drainQueue = tasks;
-                let head = 0, taskLen = tasks.length;
-                while (head < taskLen && !isClosed) {
-                    const data = tasks[head];
-                    let len = data.byteLength, end = head + 1;
-                    if (len < maxChunkLen) {
-                        while (end < taskLen) {
-                            const nextLen = len + tasks[end].byteLength;
-                            if (nextLen > maxChunkLen) break;
-                            len = nextLen, end++;
-                        }
-                    }
-                    if (end === head + 1) {
-                        tasks[head++] = undefined;
-                        await tcpWriter.write(data);
-                    } else {
-                        const out = bundleBuffer ||= new Uint8Array(maxChunkLen);
-                        out.set(data);
-                        tasks[head++] = undefined;
-                        for (let offset = data.byteLength; head < end;) {
-                            const q = tasks[head];
-                            tasks[head++] = undefined;
-                            out.set(q, offset), offset += q.byteLength;
-                        }
-                        await tcpWriter.write(out.subarray(0, len));
-                    }
-                }
-                tasks.length = 0;
+    const drain = () => {
+        timerId = null;
+        if (isClosed) return;
+        let head = 0, len = queue.length;
+        while (head < len && !isClosed) {
+            const data = queue[head];
+            let byteLen = data.byteLength, end = head + 1;
+            while (end < len) {
+                const nextLen = byteLen + queue[end].byteLength;
+                if (nextLen > maxChunkLen) break;
+                byteLen = nextLen, end++;
             }
-        } catch {closeWriter()} finally {
-            busy = false;
-            writeQueue.length && !isClosed && drain();
+            if (end === head + 1) {
+                head++, tcpWriter.write(data).catch(closeWriter);
+            } else {
+                const out = bundleBuffer ||= new Uint8Array(maxChunkLen);
+                out.set(data);
+                for (let offset = data.byteLength, i = head + 1; i < end; i++) {
+                    const q = queue[i];
+                    out.set(q, offset), offset += q.byteLength;
+                }
+                head = end, tcpWriter.write(out.subarray(0, byteLen)).catch(closeWriter);
+            }
         }
+        queue.length = 0;
     };
     return (chunk) => {
         if (isClosed) return false;
         const data = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
         if (!data.byteLength) return true;
-        writeQueue.push(data), !busy && drain();
+        queue.push(data);
+        !timerId && !isClosed && (timerId = setTimeout(drain, 1));
         return true;
     };
 };
